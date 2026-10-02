@@ -1,500 +1,423 @@
-// Kino plugin: Internet Archive (archive.org) — public-domain films and classic TV.
-// Declared hosts: archive.org and *.archive.org (downloads redirect to a storage node such as
-// dn720705.ca.archive.org).
+/// <reference path="./kino.d.ts" />
+// Doramas.org — plugin para Kino
+// Doramas y películas asiáticas subtituladas. Basado en doramasorg.py.
 
-const BASE = "https://archive.org";
-const FIELDS = ["identifier", "title", "year", "description"];
-const VALID_ID = /^[A-Za-z0-9._-]{1,100}$/;
-const PLAYABLE_EXT = /\.(mp4|m4v|webm)$/i;
-const SUBTITLE_EXT = /\.(vtt|srt)$/i;
-// Preferred playable files, best first (archive.org's "format" field, lowercased).
-const FORMAT_RANK = ["h.264", "h.264 hd", "mpeg4", "512kb mpeg4"];
-const FILMS = "collection:(feature_films) AND mediatype:(movies)";
-const TV = "collection:(classic_tv) AND mediatype:(movies)";
-const CARTOONS = "collection:(animationandcartoons) AND mediatype:(movies)";
+const HOST = "https://www.doramas.org/";
+const SEARCH_URL = HOST + "ajax/search.php";
+const PLAY_SERIES_URL = HOST + "ajax/play.php";
+const PLAY_MOVIES_URL = HOST + "ajax/play_peliculas.php";
 
-// kino.log never breaks what it reports on: in Kino 0.9.43 release builds a call to it threw (an R8 rename),
-// which would turn one failed row or title into a failed Home or search.
-function log(...args) {
-  try {
-    kino.log(...args);
-  } catch {
-    // nothing to do: the log line is lost, the result is not
+const UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36";
+const BASE_HEADERS = { "User-Agent": UA, "Accept-Language": "es-ES,es;q=0.9" };
+
+// ---------- utilidades ----------
+
+// El sitio a veces responde una verificación anti-robots ("One moment, please...")
+// en lugar del contenido; se detecta y se reintenta.
+function esVerificacion(html) {
+  return html.indexOf("One moment, please") !== -1 && html.indexOf("wsidchk") !== -1;
+}
+
+// Igual que el .py: quita saltos de línea, espacios repetidos y &nbsp;.
+function compactar(html) {
+  return html.replace(/\r|\n|\t|&nbsp;|<br\s*\/?>|\s{2,}/g, "");
+}
+
+function primerMatch(texto, re) {
+  const m = texto.match(re);
+  return m ? m[1].trim() : "";
+}
+
+// Recorre un regex global y devuelve todos los matches.
+function scan(re, texto) {
+  const out = [];
+  let m;
+  while ((m = re.exec(texto)) !== null) {
+    out.push(m);
+    if (m.index === re.lastIndex) re.lastIndex++;
   }
+  return out;
 }
 
-function advancedUrl(query, rows, page = 1, sort = "downloads desc") {
-  const parts = ["q=" + encodeURIComponent(query)];
-  for (const f of FIELDS) parts.push("fl%5B%5D=" + f);
-  parts.push("sort%5B%5D=" + encodeURIComponent(sort), "rows=" + rows, "page=" + page, "output=json");
-  return BASE + "/advancedsearch.php?" + parts.join("&");
+// Descarga texto reintentando cuando sale la verificación anti-robots.
+async function bajarTexto(url, opciones) {
+  for (let i = 0; i < 3; i++) {
+    const r = await kino.fetch(url, opciones || {});
+    const cuerpo = r.text();
+    if (r.status === 429) throw kino.error("rate_limited", "doramas.org está limitando las peticiones");
+    if (esVerificacion(cuerpo)) { await kino.sleep(1200); continue; }
+    if (!r.ok) throw kino.error("unavailable", "doramas.org respondió " + r.status);
+    return cuerpo;
+  }
+  throw kino.error("unavailable", "doramas.org no pasó la verificación automática; inténtalo de nuevo");
 }
 
-// Throws only AFTER its first await: in Kino a throw before a function's first await can't be
-// caught by its caller.
-async function getJson(url) {
-  const r = await kino.fetch(url);
-  if (!r.ok) throw new Error("archive.org respondió " + r.status);
-  return r.json();
+function bajarPagina(url, headersExtra) {
+  return bajarTexto(url, { headers: Object.assign({}, BASE_HEADERS, headersExtra || {}) });
 }
 
-function first(v) {
-  return Array.isArray(v) ? v[0] : v;
+function postForm(url, campos, referer) {
+  return bajarTexto(url, {
+    method: "POST",
+    headers: Object.assign({}, BASE_HEADERS, { Referer: referer, "X-Requested-With": "XMLHttpRequest" }),
+    body: { form: campos },
+  });
 }
 
-function toItem(doc, kind) {
-  const description = [].concat(doc.description || []).join(" ").replace(/<[^>]*>/g, "").trim();
+function slugDe(url) {
+  const partes = url.replace(/\/+$/, "").split("/");
+  return partes[partes.length - 1] || partes[partes.length - 2] || "item";
+}
+
+function absolutizar(url) {
+  if (!url) return "";
+  if (url.indexOf("//") === 0) return "https:" + url;
+  if (url.charAt(0) === "/") return HOST + url;
+  return url;
+}
+
+// ---------- catálogo (tarjetas) ----------
+
+const RE_TARJETA = /<li class="col-6 col-sm-6 col-md-4 col-lg-3 col-xl-2 col-xxl-2">([\s\S]*?)<\/li>/g;
+const RE_TITULO_TARJETA = /<div class="content_title fs-15 (?:pr-3|pe-3) truncate">([^<]+)<\/div>/;
+const RE_ANIO = /<div class="status">([^<]*)<\/div>/;
+
+function tarjetaAItem(bloque, tipo) {
+  const url = primerMatch(bloque, /href="([^"]+)"/);
+  if (!url) return null;
+  let titulo = primerMatch(bloque, RE_TITULO_TARJETA);
+  const anio = primerMatch(bloque, RE_ANIO);
+  if (anio && titulo.indexOf("(" + anio + ")") !== -1) titulo = titulo.replace("(" + anio + ")", "").trim();
+  const poster = primerMatch(bloque, /src="([^"]+)"/);
+  if (!titulo) return null;
+  const slug = slugDe(url);
   return {
-    id: doc.identifier,
-    ref: doc.identifier,
-    title: String(first(doc.title) || doc.identifier),
-    kind,
-    year: doc.year ? String(first(doc.year)) : undefined,
-    poster: BASE + "/services/img/" + encodeURIComponent(doc.identifier),
-    overview: description ? description.slice(0, 400) : undefined,
+    id: (tipo === "movie" ? "m-" : "s-") + slug,
+    ref: (tipo === "movie" ? "m:" : "s:") + url,
+    title: titulo,
+    kind: tipo,
+    year: anio || undefined,
+    poster: poster || undefined,
+    lang: "es",
   };
 }
 
-async function docs(query, rows, page = 1, sort) {
-  const data = await getJson(advancedUrl(query, rows, page, sort));
-  // A query archive.org can't parse still answers 200, with {"error": ...} instead of "response".
-  if (!data.response) throw new Error("archive.org no entendió la búsqueda");
-  return data.response.docs.filter((d) => VALID_ID.test(d.identifier));
+function parsearCatalogo(html, tipo) {
+  const items = [];
+  for (const m of scan(RE_TARJETA, html)) {
+    const it = tarjetaAItem(compactar(m[1]), tipo);
+    if (it) items.push(it);
+  }
+  return items;
 }
 
-// ---- The person's own addresses (Configurar: the "sources" list) ---------------------------------------
-const NEWEST = "addeddate desc";
-
-// One address: a collection or item (archive.org/details/<id>) or a search (archive.org/search?query=...).
-// Anything else, or another site, is left out: the plugin only ever talks to archive.org.
-function parseSource(raw) {
-  const text = String(raw || "").trim();
-  if (!text) return null;
-  let u;
-  try {
-    u = new URL(text);
-  } catch {
-    return null;
-  }
-  if (u.protocol !== "https:" && u.protocol !== "http:") return null;
-  if (u.hostname !== "archive.org" && !u.hostname.endsWith(".archive.org")) return null;
-  const details = /^\/details\/([^/?#]+)/.exec(u.pathname);
-  if (details) {
-    const id = decodeURIComponent(details[1]);
-    return VALID_ID.test(id) ? { kind: "details", id } : null;
-  }
-  if (u.pathname === "/search") {
-    const q = (u.searchParams.get("query") || u.searchParams.get("q") || "").trim();
-    if (q) return { kind: "search", query: q };
+function siguienteCursor(html, actual) {
+  const c = compactar(html);
+  const i = c.indexOf('aria-label="Page navigation"');
+  if (i === -1) return null;
+  const nav = c.slice(i, i + 6000);
+  const a = nav.indexOf("page-item active");
+  if (a === -1) return null;
+  const cur = parseInt(actual || "1", 10);
+  for (const m of scan(/href="[^"]*pagina=(\d+)[^"]*"/g, nav.slice(a))) {
+    if (parseInt(m[1], 10) > cur) return m[1];
   }
   return null;
 }
 
-// Six url/cat slot pairs (url1, cat1 ... url6, cat6): plain settings every Kino since apiVersion 1 understands, so the
-// plugin installs on Kino versions without list settings (the `sources` list of 1.3.0-1.4.1 needed apiVersion 4).
-// Kino hands a plugin only the settings its manifest declares, so an old stored list never reaches this code.
-const SLOTS = 6;
-function sources() {
+// ---------- temporadas y capítulos ----------
+
+const RE_TEMPORADA = /<a class="number__season[^"]*"[^>]*href="([^"]+)"[\s\S]*?<h6 class="card-title">([^<]+)<\/h6>/g;
+const RE_BLOQUE_CAPS = /<div class="chapters__list([\s\S]*?)<\/article>/;
+const RE_CAPITULO = /<a class="media"[\s\S]*?href="([^"]+)"[\s\S]*?<h6 class="body-title truncate">([^<]+)<\/h6>/g;
+
+function enlacesTemporadas(html) {
   const out = [];
-  for (let i = 1; i <= SLOTS; i++) {
-    const s = parseSource(kino.config.get("url" + i));
-    // `id` is the archive.org identifier; `key` is this address's slot; `category` is the optional row name the person gave it.
-    if (s) out.push({ ...s, key: "src" + i, category: String(kino.config.get("cat" + i) || "").trim().slice(0, 60) });
+  for (const m of scan(RE_TEMPORADA, compactar(html))) {
+    const n = parseInt((m[2].match(/\d+/) || [])[0] || "0", 10) || out.length + 1;
+    out.push({ url: m[1], numero: n });
   }
   return out;
 }
 
-// What a details address lists: the videos of a collection, or, when nothing is filed under it, that one item.
-// Asked once per address for as long as the runtime lives.
-const scopes = new Map();
-async function scopeInfo(source) {
-  if (source.kind === "search") return { query: "(" + source.query + ") AND mediatype:(movies)", item: false };
-  if (!scopes.has(source.key)) {
-    const collection = "collection:(" + source.id + ") AND mediatype:(movies)";
-    const inside = await docs(collection, 1);
-    scopes.set(source.key, inside.length ? { query: collection, item: false } : { query: "identifier:(" + source.id + ") AND mediatype:(movies)", item: true });
+function parsearCapitulos(html, temporada) {
+  const m = html.match(RE_BLOQUE_CAPS);
+  const bloque = m ? m[1] : "";
+  const caps = [];
+  for (const c of scan(RE_CAPITULO, bloque)) {
+    const etiqueta = c[2].replace(/\s+/g, " ").trim();
+    let numero = parseInt((etiqueta.match(/\d+/) || [])[0] || "0", 10);
+    if (!numero) numero = caps.length + 1;
+    caps.push({ season: temporada || 1, number: numero, ref: "e:" + c[1], title: etiqueta });
   }
-  return scopes.get(source.key);
+  return caps;
 }
 
-async function scopeOf(source) {
-  return (await scopeInfo(source)).query;
-}
-
-// An item address with several videos shows one card per video (a single video stays the item's one card). The card's id is
-// `<identifier>~<n>` (an id cannot hold `|`); its ref is `<identifier>|<file>`, which `resolve` already plays.
-const MAX_VIDEO_CARDS = 100;
-async function videoCards(identifier, doc) {
-  const meta = await metadata(identifier);
-  const originals = videoOriginals(meta.files);
-  if (originals.length < 2) return [];
-  const base = toItem(doc || { identifier, title: first(meta.metadata && meta.metadata.title) }, "movie");
-  return originals.slice(0, MAX_VIDEO_CARDS).map((f, i) => ({
-    ...base,
-    id: identifier + "~" + (i + 1),
-    ref: identifier + "|" + f.name,
-    title: (base.title + " · " + episodeTitle(f)).slice(0, 200),
-  }));
-}
-
-// The cards of a list of archive.org docs: the ones that are an item address with several videos are expanded.
-async function cardsOf(found, sourceList) {
-  const itemIds = new Set();
-  for (const s of sourceList) if (s.kind === "details" && (await scopeInfo(s)).item) itemIds.add(s.id);
-  const out = [];
-  for (const d of found) {
-    let parts = [];
-    if (itemIds.has(d.identifier)) {
-      try {
-        parts = await videoCards(d.identifier, d);
-      } catch (e) {
-        log("videos of", d.identifier, "failed", e.message);
+async function listarCapitulos(urlSerie) {
+  const html = await bajarPagina(urlSerie);
+  const temporadas = enlacesTemporadas(html);
+  const caps = [];
+  if (temporadas.length) {
+    for (const t of temporadas) {
+      const pagina = await bajarPagina(t.url);
+      for (const cap of parsearCapitulos(pagina, t.numero)) {
+        if (!caps.some((x) => x.season === cap.season && x.number === cap.number)) caps.push(cap);
       }
     }
-    if (parts.length) out.push(...parts);
-    else out.push(toItem(d, "movie"));
+  } else {
+    caps.push(...parsearCapitulos(html, 1));
   }
-  return out;
+  return caps;
 }
 
-async function titleOf(source) {
-  if (source.kind === "search") return ("Búsqueda: " + source.query).slice(0, 80);
-  try {
-    const data = await getJson(BASE + "/metadata/" + encodeURIComponent(source.id) + "/metadata");
-    const title = first(data && data.result && data.result.title);
-    if (title) return String(title).slice(0, 80);
-  } catch (e) {
-    log("title failed", source.id, e.message);
-  }
-  return source.id;
-}
+// ---------- búsqueda ----------
 
-// The Home rows the addresses make: an address with a category joins the row of that category (same name, any capitals; the
-// row keeps the first spelling and is keyed by the first address's slot); an address without one is a row of its own.
-function ownRows() {
-  const out = [];
-  const byCategory = new Map();
-  for (const s of sources()) {
-    if (!s.category) {
-      out.push({ key: s.key, title: null, sources: [s] });
-      continue;
+async function buscarAjax(texto, tipo) {
+  const referer = tipo === "movie" ? HOST + "movies/" : HOST + "catalogo/";
+  const cuerpo = await postForm(SEARCH_URL, { title: texto.replace(/ /g, "+") }, referer);
+  const raw = cuerpo.replace(/\\\//g, "/");
+  const items = [];
+  const vistos = {};
+  const re = /"slug"\s*:\s*"([^"]+)"[\s\S]*?"titulo"\s*:\s*"([^"]*)"[\s\S]*?"img"\s*:\s*"([^"]*)"/g;
+  for (const m of scan(re, raw)) {
+    const slug = m[1];
+    if (!slug || vistos[tipo + slug]) continue;
+    vistos[tipo + slug] = 1;
+    const titulo = m[2].trim();
+    if (!titulo) continue;
+    let poster = (m[3] || "").trim();
+    if (poster && poster.charAt(0) === "/") poster = "https://pics.doramas.org" + poster;
+    if (tipo === "movie") {
+      items.push({ id: "m-" + slug, ref: "m:" + HOST + "movies/" + slug + "/", title: titulo, kind: "movie", poster: poster || undefined, lang: "es" });
+    } else {
+      items.push({ id: "s-" + slug, ref: "s:" + HOST + slug + "/", title: titulo, kind: "series", poster: poster || undefined, lang: "es" });
     }
-    const name = s.category.toLowerCase();
-    if (!byCategory.has(name)) {
-      const row = { key: "cat" + s.key.slice(3), title: s.category, sources: [] };
-      byCategory.set(name, row);
-      out.push(row);
-    }
-    byCategory.get(name).sources.push(s);
+    if (items.length >= 60) break;
   }
-  return out;
-}
-
-// One archive.org query for a whole row (or for every address, in a search): its addresses' scopes, joined.
-async function queryOf(sourceList) {
-  const scopesOf = [];
-  for (const s of sourceList) scopesOf.push(await scopeOf(s));
-  return scopesOf.length === 1 ? scopesOf[0] : scopesOf.map((x) => "(" + x + ")").join(" OR ");
-}
-
-// Letters, digits and apostrophes inside words only: any other character can be query syntax to
-// advancedsearch (a stray "/", "-", "&" or "'" makes it answer {"error": ...}). So are the words
-// and/or/not in any case (a dangling one is an error too); dropping them never changes which
-// titles match. Word edges are spelled out with \p{} classes: \b is ASCII-only, so it would cut
-// the "or" out of "Señor".
-function cleanTitle(raw) {
-  return String(raw || "")
-    .replace(/[^\p{L}\p{M}\p{N}' ]+/gu, " ")
-    .replace(/(?<![\p{L}\p{M}\p{N}])'|'(?![\p{L}\p{M}\p{N}])/gu, " ")
-    .replace(/(?<![\p{L}\p{M}\p{N}])(and|or|not)(?![\p{L}\p{M}\p{N}])/giu, " ")
-    .replace(/\s+/g, " ")
-    .trim();
-}
-
-// Lowercase letters and digits only, accents folded: how a title and an identifier are compared.
-function squash(text) {
-  const lower = String(text || "").toLowerCase();
-  return (typeof lower.normalize === "function" ? lower.normalize("NFKD") : lower).replace(/[^a-z0-9]/g, "");
-}
-
-// How many forms of the title are asked of archive.org: what was typed, the original title and at
-// most two of Kino's other titles. Each form is two requests (films and TV), all sent at once, so a
-// search stays far under the 60 requests and 15 seconds of one call.
-const MAX_FORMS = 4;
-
-// The forms of the title archive.org is asked, best first, one per distinct text: `q`, then
-// `originalTitle`, then `altTitles`. Each is cut to its head (kino.rank.shortQuery: up to the first
-// ":", "," ...), because archive.org's title search wants every word, and a subtitle Kino's title
-// has ("Nosferatu, el vampiro") is rarely in archive.org's.
-function titleForms(query) {
-  const out = [];
-  const seen = new Set();
-  const given = [query.q, query.originalTitle].concat(Array.isArray(query.altTitles) ? query.altTitles : []);
-  for (const raw of given) {
-    if (out.length >= MAX_FORMS) break;
-    if (typeof raw !== "string" || !raw.trim()) continue;
-    const text = cleanTitle(kino.rank.shortQuery(raw));
-    const key = squash(text);
-    if (!key || seen.has(key)) continue;
-    seen.add(key);
-    out.push(text);
-  }
-  return out;
-}
-
-// With the year known, what is from that year (give or take one) goes first, then what has no
-// year, then the rest. Only an order: archive.org's years are often an upload's, and a remake is
-// still a real answer. Stable, so archive.org's own order (most downloaded) stays among equals.
-function byYear(items, year) {
-  const wanted = Number(year) || 0;
-  if (!wanted) return items;
-  const place = (item) => {
-    const y = parseInt(item.year, 10);
-    if (!y) return 1;
-    return Math.abs(y - wanted) <= 1 ? 0 : 2;
-  };
-  return items.map((item, i) => ({ item, i, p: place(item) })).sort((a, b) => a.p - b.p || a.i - b.i).map((x) => x.item);
+  return items;
 }
 
 export async function search(query) {
-  const forms = titleForms(query);
-  if (!forms.length) return [];
-  const text = forms[0];
-  const titleQuery = (form) => "title:(" + form + ")";
-  const anyTitle = forms.length === 1 ? titleQuery(text) : "(" + forms.map(titleQuery).join(" OR ") + ")";
-  // Both collections are always searched: `type` is only a hint. Kino sends it from TMDB's movie/tv
-  // split, which does not line up with archive.org's (public-domain films and classic TV are mixed,
-  // and a title can be in both), so filtering by it lost real matches. It only decides which group
-  // comes first.
-  const groups = [
-    { kind: "movie", where: FILMS },
-    { kind: "series", where: TV },
-  ];
-  if (query.type === "series") groups.reverse();
-  const out = [];
-  const seen = new Set();
-  // What is inside the person's own addresses comes first, as archive.org lists it: the person chose
-  // those addresses, so nothing there is ranked away.
-  const mine = sources();
-  if (mine.length) {
-    try {
-      const hits = (await docs(anyTitle + " AND (" + (await queryOf(mine)) + ")", 25)).filter((d) => !seen.has(d.identifier));
-      for (const card of await cardsOf(hits, mine)) {
-        if (seen.has(card.id)) continue;
-        seen.add(card.id);
-        out.push(card);
-      }
-      // An item address with several videos is also searched by its videos' own titles.
-      const wordLists = forms.map((f) => f.toLowerCase().split(" "));
-      for (const s of mine) {
-        if (s.kind !== "details" || !(await scopeInfo(s)).item) continue;
-        for (const card of await videoCards(s.id)) {
-          const title = card.title.toLowerCase();
-          if (seen.has(card.id) || !wordLists.some((words) => words.every((w) => title.includes(w)))) continue;
-          seen.add(card.id);
-          out.push(card);
-        }
-      }
-    } catch (e) {
-      log("search in the person's addresses failed", e.message);
-    }
-  }
-  // Every form in both collections, all at once. A form archive.org fails on is left out; only when
-  // every one fails does the search fail.
-  const asks = [];
-  for (const group of groups) {
-    for (const form of forms) {
-      asks.push(
-        (async () => {
-          try {
-            return { group, found: await docs(titleQuery(form) + " AND " + group.where, 25) };
-          } catch (e) {
-            return { group, error: e };
-          }
-        })()
-      );
-    }
-  }
-  const answers = await Promise.all(asks);
-  if (answers.every((a) => a.error)) throw answers[0].error;
-  const found = [];
-  for (const a of answers) {
-    if (a.error) {
-      log("search failed for one title", a.error.message);
-      continue;
-    }
-    for (const d of a.found) {
-      // An item can be in both collections, or be found by several forms: it is listed once, as the
-      // kind of the group that came first.
-      if (seen.has(d.identifier)) continue;
-      seen.add(d.identifier);
-      found.push(toItem(d, a.group.kind));
-    }
-  }
-  // Ranked against every title Kino knows for the work and every form asked: what shares most of
-  // their words first, a near-miss dropped. An item whose identifier is one of those titles exactly
-  // ("nosferatu" for "Nosferatu") always stays.
-  const titles = [query.q, query.originalTitle]
-    .concat(Array.isArray(query.altTitles) ? query.altTitles : [], forms)
-    .filter((t) => typeof t === "string" && t.trim());
-  const exact = new Set(titles.map(squash).filter(Boolean));
-  const relevant = new Set(kino.rank.filterRelevant(found, titles));
-  const kept = found.filter((item) => relevant.has(item) || exact.has(squash(item.id)));
-  return out.concat(kino.rank.sortBySimilarity(byYear(kept, query.year), titles));
+  await null;
+  const texto = (query.q || "").trim();
+  if (!texto) return [];
+  if (query.type === "movie") return await buscarAjax(texto, "movie");
+  if (query.type === "series") return await buscarAjax(texto, "series");
+  const series = await buscarAjax(texto, "series");
+  const pelis = await buscarAjax(texto, "movie");
+  return series.concat(pelis).slice(0, 100);
 }
 
-// Home rows; each one's id is also its "Ver más" ref (the browse capability).
-const ROWS = [
-  { id: "films", title: "Películas de dominio público", query: FILMS, kind: "movie" },
-  { id: "tv", title: "Televisión clásica", query: TV, kind: "series" },
-  { id: "cartoons", title: "Animación clásica", query: CARTOONS, kind: "movie" },
-];
-const ROW_SIZE = 30;
-const PAGE_SIZE = 50;
+// ---------- home ----------
 
-export async function home() {
+const RE_TARJETA_CAP = /<li class="col-6 col-sm-6 col-md-4 col-lg-4 col-xl-3 col-xxl-3">([\s\S]*?)<\/li>/g;
+
+async function filaUltimos() {
+  const html = await bajarPagina(HOST + "nuevos/");
+  const items = [];
+  for (const m of scan(RE_TARJETA_CAP, html)) {
+    const bloque = compactar(m[1]);
+    const url = primerMatch(bloque, /href="([^"]+)"/);
+    const serie = primerMatch(bloque, /<div class="content_subtitle truncate">([^<]+)<\/div>/);
+    if (!url || !serie) continue;
+    const etiqueta = primerMatch(bloque, /<div class="content_title truncate">([^<]+)</);
+    const numero = parseInt((etiqueta.match(/\d+/) || [])[0] || "0", 10);
+    const poster = primerMatch(bloque, /src="([^"]+)"/);
+    items.push({
+      id: "u-" + slugDe(url),
+      ref: "ep:" + url,
+      title: serie + (numero ? " — Cap. " + numero : ""),
+      kind: "series",
+      poster: poster || undefined,
+      lang: "es",
+      badges: numero ? ["Cap. " + numero] : undefined,
+    });
+    if (items.length >= 12) break;
+  }
+  return items;
+}
+
+function generosDe(html) {
+  const c = compactar(html);
+  const i = c.indexOf("los generos");
+  const f = c.indexOf("los paises", i);
+  const bloque = i === -1 ? "" : c.slice(i, f === -1 ? i + 8000 : f);
   const out = [];
-  // The person's own addresses, newest first, before the plugin's own rows.
-  for (const row of ownRows()) {
-    try {
-      const found = await docs(await queryOf(row.sources), ROW_SIZE, 1, NEWEST);
-      if (found.length) out.push({ id: row.key, title: row.title || (await titleOf(row.sources[0])), ref: row.key, items: await cardsOf(found, row.sources) });
-    } catch (e) {
-      log("home row failed", row.key, e.message);
-    }
+  const re = /id="([^"]+)"[^>]*><label class="(?:form-check-label|custom-control-label)"[^>]*>([^<]+)<\/label>/g;
+  for (const m of scan(re, bloque)) {
+    const nombre = m[2].trim();
+    if (m[1] && nombre) out.push({ id: m[1], nombre: nombre });
   }
-  for (const row of ROWS) {
-    try {
-      const found = await docs(row.query, ROW_SIZE);
-      out.push({ id: row.id, title: row.title, ref: row.id, items: found.map((d) => toItem(d, row.kind)) });
-    } catch (e) {
-      log("home row failed", row.id, e.message);
-    }
-  }
+  out.sort((a, b) => (a.nombre.toLowerCase() < b.nombre.toLowerCase() ? -1 : 1));
   return out;
 }
 
-// "Ver más" on a Home row: the same query, a page at a time. The cursor is the next page number.
+export async function home() {
+  await null;
+  const filas = [];
+  try {
+    const items = await filaUltimos();
+    if (items.length) filas.push({ id: "ultimos", title: "Últimos capítulos", items: items, genre: "series" });
+  } catch (e) { kino.log("doramas: no se pudo cargar últimos capítulos:", String((e && e.message) || e)); }
+
+  const catalogos = [
+    { id: "doramas", titulo: "Doramas", ref: "cat:catalogo", url: HOST + "catalogo/", tipo: "series", genre: "series", guardarHtml: true },
+    { id: "peliculas", titulo: "Películas asiáticas", ref: "cat:movies", url: HOST + "movies/", tipo: "movie", genre: "peliculas" },
+    { id: "emision", titulo: "En emisión", ref: "status:1", url: HOST + "catalogo?status=1", tipo: "series", genre: "series" },
+    { id: "finalizados", titulo: "Finalizados", ref: "status:2", url: HOST + "catalogo?status=2", tipo: "series", genre: "series" },
+  ];
+  let htmlCatalogo = "";
+  for (const cat of catalogos) {
+    try {
+      const html = await bajarPagina(cat.url);
+      if (cat.guardarHtml) htmlCatalogo = html;
+      const items = parsearCatalogo(html, cat.tipo).slice(0, 12);
+      if (items.length) filas.push({ id: cat.id, title: cat.titulo, ref: cat.ref, items: items, genre: cat.genre });
+    } catch (e) { kino.log("doramas: fila " + cat.id + " falló:", String((e && e.message) || e)); }
+  }
+
+  // Filas por género (máximo 6), reutilizando el HTML del catálogo.
+  try {
+    if (!htmlCatalogo) htmlCatalogo = await bajarPagina(HOST + "catalogo/");
+    for (const g of generosDe(htmlCatalogo).slice(0, 6)) {
+      try {
+        const url = HOST + "catalogo?genre%5B%5D=" + encodeURIComponent(g.id);
+        const items = parsearCatalogo(await bajarPagina(url), "series").slice(0, 12);
+        if (items.length) filas.push({ id: "g" + g.id.replace(/[^A-Za-z0-9]/g, ""), title: "Doramas de " + g.nombre, ref: "genre:" + g.id, items: items, genre: "series" });
+      } catch (e) { kino.log("doramas: género " + g.nombre + " falló"); }
+    }
+  } catch (e) { kino.log("doramas: no se pudieron cargar los géneros"); }
+
+  if (!filas.length) throw kino.error("unavailable", "no se pudo cargar ninguna fila");
+  return filas;
+}
+
+// ---------- browse (Ver más) ----------
+
 export async function browse(ref, cursor) {
-  await null; // the checks below may throw: never before the first await
-  const own = ownRows().find((r) => r.key === ref);
-  const row = own || ROWS.find((r) => r.id === ref);
-  if (!row) throw kino.error("not_found", "esa fila ya no existe");
-  const page = cursor ? Number(cursor) : 1;
-  if (!Number.isInteger(page) || page < 1 || page > 100) throw kino.error("not_found", "página inválida");
-  const found = own ? await docs(await queryOf(own.sources), PAGE_SIZE, page, NEWEST) : await docs(row.query, PAGE_SIZE, page);
-  return { items: own ? await cardsOf(found, own.sources) : found.map((d) => toItem(d, row.kind)), next: found.length === PAGE_SIZE ? String(page + 1) : undefined };
-}
-
-async function metadata(id) {
-  const data = await getJson(BASE + "/metadata/" + encodeURIComponent(id));
-  if (!data || !Array.isArray(data.files)) throw new Error("archive.org no tiene ese item");
-  return data;
-}
-
-// "Season 2" after "Season 10" is wrong; compare digit runs as numbers.
-function natural(a, b) {
-  const x = a.split(/(\d+)/);
-  const y = b.split(/(\d+)/);
-  for (let i = 0; i < Math.min(x.length, y.length); i++) {
-    if (x[i] === y[i]) continue;
-    if (i % 2 === 1) return Number(x[i]) - Number(y[i]);
-    return x[i] < y[i] ? -1 : 1;
+  await null;
+  const partes = ref.split(":");
+  let url, tipo;
+  if (partes[0] === "cat") {
+    url = HOST + partes[1] + "/";
+    tipo = partes[1] === "movies" ? "movie" : "series";
+  } else if (partes[0] === "status") {
+    url = HOST + "catalogo?status=" + encodeURIComponent(partes[1] || "1");
+    tipo = "series";
+  } else if (partes[0] === "genre") {
+    url = HOST + "catalogo?genre%5B%5D=" + encodeURIComponent(partes.slice(1).join(":"));
+    tipo = "series";
+  } else {
+    throw kino.error("not_found", "sección desconocida");
   }
-  return x.length - y.length;
+  if (cursor) url += (url.indexOf("?") === -1 ? "?" : "&") + "pagina=" + encodeURIComponent(cursor);
+  const html = await bajarPagina(url);
+  const items = parsearCatalogo(html, tipo);
+  if (!items.length) throw kino.error("not_found", "esta sección está vacía o no existe");
+  const pagina = { items: items };
+  const next = siguienteCursor(html, cursor);
+  if (next) pagina.next = next;
+  return pagina;
 }
 
-// A video is an original file something playable exists for: itself (mp4/m4v/webm) or a derivative
-// made from it (its `original` field). The extension of the original tells nothing: real items
-// hold .avi, .mpg, .mkv and .divx originals next to their derived mp4.
-function videoOriginals(files) {
-  const playable = new Set();
-  for (const f of files) {
-    if (!PLAYABLE_EXT.test(f.name)) continue;
-    const from = f.source === "original" ? f.name : f.original;
-    if (from) playable.add(from);
-  }
-  return files
-    .filter((f) => f.source === "original" && playable.has(f.name))
-    .sort((a, b) => natural(a.name, b.name));
-}
-
-function stem(name) {
-  return name.replace(/\.[^./]+$/, "");
-}
-
-function rank(f) {
-  const i = FORMAT_RANK.indexOf(String(f.format || "").toLowerCase());
-  return i === -1 ? FORMAT_RANK.length : i;
-}
-
-function bestPlayable(files, original) {
-  const family = files.filter((f) => (f.name === original.name || f.original === original.name) && PLAYABLE_EXT.test(f.name));
-  family.sort((a, b) => rank(a) - rank(b));
-  return family[0] || null;
-}
-
-function downloadUrl(id, name) {
-  return BASE + "/download/" + encodeURIComponent(id) + "/" + name.split("/").map(encodeURIComponent).join("/");
-}
-
-function subtitlesFor(id, files, original) {
-  const base = stem(original.name) + ".";
-  return files
-    .filter((f) => SUBTITLE_EXT.test(f.name) && f.name.startsWith(base))
-    .map((f) => ({
-      lang: /[._](es|spa|spanish)[._]/i.test(f.name) ? "es" : "en",
-      url: downloadUrl(id, f.name),
-      format: /\.srt$/i.test(f.name) ? "srt" : "vtt",
-    }));
-}
-
-function numbering(originals) {
-  const found = originals.map((f) => /S(\d{1,3})E(\d{1,4})/i.exec(f.name));
-  if (found.every((m) => m)) return found.map((m) => ({ season: Number(m[1]), number: Number(m[2]) }));
-  return originals.map((_, i) => ({ season: 1, number: i + 1 }));
-}
-
-function episodeTitle(f) {
-  if (f.title) return String(f.title);
-  const name = stem(f.name.split("/").pop());
-  const m = /S\d{1,3}E\d{1,4}\s*-\s*(.+)$/i.exec(name);
-  return m ? m[1] : name;
-}
+// ---------- episodes ----------
 
 export async function episodes(ref) {
-  const meta = await metadata(ref);
-  const originals = videoOriginals(meta.files);
-  const numbers = numbering(originals);
-  return {
-    series: {
-      title: String(first(meta.metadata && meta.metadata.title) || ref),
-      poster: BASE + "/services/img/" + encodeURIComponent(ref),
-    },
-    episodes: originals.map((f, i) => ({
-      season: numbers[i].season,
-      number: numbers[i].number,
-      ref: ref + "|" + f.name,
-      title: episodeTitle(f),
-    })),
-  };
+  await null;
+  if (ref.startsWith("s:")) {
+    const caps = await listarCapitulos(ref.slice(2));
+    if (!caps.length) throw kino.error("not_found", "no se encontraron capítulos");
+    return { episodes: caps };
+  }
+  if (ref.startsWith("ep:")) {
+    // Viene de "Últimos capítulos": la ref apunta a la página de UN capítulo.
+    const urlCap = ref.slice(3);
+    const html = await bajarPagina(urlCap);
+    if (enlacesTemporadas(html).length) {
+      const caps = await listarCapitulos(urlCap);
+      if (caps.length) return { episodes: caps };
+    }
+    let caps = parsearCapitulos(html, 1);
+    if (caps.length) return { episodes: caps };
+    // Se adivina la página de la serie: .../nombre-c8/ -> .../nombre/
+    const m = urlCap.match(/\/([a-z0-9-]+)-c(\d+)\/?$/);
+    if (m) {
+      caps = await listarCapitulos(HOST + m[1] + "/");
+      if (caps.length) return { episodes: caps };
+    }
+    throw kino.error("not_found", "no se encontró la serie de este capítulo");
+  }
+  throw kino.error("not_found", "referencia desconocida");
+}
+
+// ---------- resolve (video) ----------
+
+const RE_BLOQUE_SERVERS = /<ul class="dropdown-menu server([\s\S]*?)<\/ul>/;
+const RE_SERVER = /<li data-lang="([^"]*)"[^>]*data-langname="([^"]*)"[\s\S]*?<a class="check">([^<]*)<\/a>/g;
+const RE_IFRAME = /<iframe[^>]+src="([^"]+)"/;
+
+function encabezadosStream(referer) {
+  return { Referer: referer, "User-Agent": UA };
+}
+
+// Busca una dirección de video directa (.m3u8/.mp4) dentro de la página del reproductor externo.
+function buscarVideoDirecto(html) {
+  const limpiar = (u) => u.replace(/\\\//g, "/").replace(/["'\\<>\s]+$/, "").trim();
+  const m3u8 = [], archivos = [], otros = [];
+  for (const m of scan(/https?:(?:\\?\/){2}[^\s"'<>]+?\.m3u8[^\s"'<>]*/g, html)) m3u8.push(limpiar(m[0]));
+  for (const m of scan(/["']file["']\s*:\s*["']([^"']+)["']/g, html)) archivos.push(limpiar(m[1]));
+  for (const m of scan(/https?:(?:\\?\/){2}[^\s"'<>]+?\.(?:mp4|webm|mkv)[^\s"'<>]*/gi, html)) otros.push(limpiar(m[0]));
+  for (const u of m3u8.concat(archivos, otros)) {
+    if (/^https?:\/\//.test(u)) return u;
+  }
+  return "";
 }
 
 export async function resolve(ref) {
-  const cut = ref.indexOf("|");
-  const id = cut === -1 ? ref : ref.slice(0, cut);
-  const wanted = cut === -1 ? null : ref.slice(cut + 1);
-  const meta = await metadata(id);
-  const originals = videoOriginals(meta.files);
-  const original = wanted ? originals.find((f) => f.name === wanted) : originals[0];
-  if (!original) throw new Error("este item no tiene video");
-  const file = bestPlayable(meta.files, original);
-  if (!file) throw new Error("no hay una versión que se pueda reproducir (mp4 o webm)");
-  const seconds = Number(file.length || original.length || 0);
-  return {
-    url: downloadUrl(id, file.name),
-    mime: /\.webm$/i.test(file.name) ? "video/webm" : "video/mp4",
-    subtitles: subtitlesFor(id, meta.files, original),
-    durationMs: seconds > 0 ? Math.round(seconds * 1000) : undefined,
-  };
+  await null;
+  let tipo, url;
+  if (ref.startsWith("m:")) { tipo = "movie"; url = ref.slice(2); }
+  else if (ref.startsWith("e:")) { tipo = "episode"; url = ref.slice(2); }
+  else if (ref.startsWith("ep:")) { tipo = "episode"; url = ref.slice(3); }
+  else throw kino.error("not_found", "referencia desconocida");
+
+  const html = await bajarPagina(url);
+  const cuerpo = compactar(html);
+  const bloqueM = cuerpo.match(RE_BLOQUE_SERVERS);
+  const intents = [];
+  for (const m of scan(RE_SERVER, bloqueM ? bloqueM[0] : "")) {
+    if (m[1]) intents.push({ id: m[1], nombre: m[3].trim() });
+  }
+  if (!intents.length) {
+    // algunas películas traen el iframe directo en la página (como dice el .py)
+    const src = primerMatch(cuerpo, RE_IFRAME);
+    if (src) intents.push({ iframe: absolutizar(src) });
+  }
+
+  const playUrl = tipo === "movie" ? PLAY_MOVIES_URL : PLAY_SERIES_URL;
+  let detalle = "";
+  for (const it of intents.slice(0, 8)) {
+    let embed = it.iframe || "";
+    if (!embed) {
+      try {
+        const resp = await postForm(playUrl, { id: it.id }, url);
+        embed = absolutizar(primerMatch(compactar(resp), RE_IFRAME));
+      } catch (e) {
+        detalle = String((e && e.message) || e);
+        continue;
+      }
+    }
+    if (!embed) continue;
+    if (/\.(m3u8|mp4|webm|mkv)(\?|#|$)/i.test(embed)) {
+      return { url: embed, headers: encabezadosStream(url), expiresInSeconds: 3600 };
+    }
+    try {
+      const paginaEmbed = await bajarPagina(embed, { Referer: url });
+      const video = buscarVideoDirecto(paginaEmbed);
+      if (video) return { url: video, headers: encabezadosStream(embed), expiresInSeconds: 3600 };
+    } catch (e) {
+      detalle = String((e && e.message) || e);
+    }
+  }
+  throw kino.error("not_found", "no se encontró un video reproducible" + (detalle ? ": " + detalle.slice(0, 140) : ""));
 }
