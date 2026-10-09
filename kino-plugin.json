@@ -1,7 +1,7 @@
 {
   "id": "doramasorg",
   "name": "Doramas.org",
-  "version": "2.0.0",
+  "version": "2.1.0",
   "apiVersion": 6,
   "entry": "plugin.js",
   "icon": "icon.png",
@@ -18,7 +18,8 @@
     "short.icu",
     "voe.sx",
     "vk.com",
-    "playmogo.com"
+    "playmogo.com",
+    "pixeldrain.com"
   ],
   "streamHosts": "any",
   "browser": true,

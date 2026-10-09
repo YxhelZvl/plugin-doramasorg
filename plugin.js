@@ -6,11 +6,13 @@
 // Servidores del sitio (se eligen por idioma, su hash cambia por título):
 //   Korii  -> kory.4meplayer.pro   (armado por JS: navegador oculto)
 //   Maru   -> my.mail.ru           (API de metadatos: MP4 directo)
-//   Okru   -> ok.ru                (armado por JS: navegador oculto)
-//   PDrive -> doramas.org/kmp4.php -> stream.php -> MP4 directo (pixeldrain)
+//   Okru   -> ok.ru                (config del reproductor: MP4 directo)
+//   PDrive -> doramas.org/kmp4.php -> stream.php -> pixeldrain (se
+//             comprueba que el archivo siga vivo)
 //   Evo    -> voe.sx               (armado por JS: navegador oculto)
-// El video final vive en CDNs que rotan (pixeldrain, cdn*.my.mail.ru, ...),
-// por eso el manifiesto declara "streamHosts": "any".
+//   VK, Dodo -> armados por JS: navegador oculto
+// El video final vive en CDNs que rotan (pixeldrain, cdn*.my.mail.ru,
+// okcdn.ru, ...), por eso el manifiesto declara "streamHosts": "any".
 
 const HOST = "https://www.doramas.org/";
 const SEARCH_URL = HOST + "ajax/search.php";
@@ -599,26 +601,59 @@ async function iframeDeServidor(hash, esPelicula, referer) {
   return primerMatch(cuerpo, RE_IFRAME);
 }
 
-// PDrive: reproductor JW cuyo "file" es stream.php, que redirige al MP4
-// en un CDN que rota (pixeldrain, ...). Se devuelve la dirección de
-// doramas.org y deja que el reproductor siga la redirección: eso lo cubre
-// "streamHosts": "any" (kino.fetch no puede seguir a un host no declarado).
+// PDrive: reproductor JW cuyo "file" es stream.php, que
+// redirige al MP4 en el CDN del sitio (pixeldrain). Cuando
+// el destino es un host declarado, se pide sin seguir la
+// redirección: así se sabe si el archivo aún existe (un
+// 404/410 significa que expiró) y el reproductor recibe la
+// dirección final, sin saltos. Si no se puede comprobar, se
+// devuelve la dirección de doramas.org y el reproductor sigue
+// la redirección (cubierto por "streamHosts": "any").
 async function resolverKmp4(src, referer) {
   const html = await bajarPagina(src, { Referer: referer });
   const archivo = primerMatch(html, /"file"\s*:\s*"([^"]+)"/);
   if (!archivo) return null;
   const url = absolutizar(archivo);
   if (!url) return null;
+  try {
+    const r = await kino.fetch(url, {
+      headers: { Referer: HOST },
+      redirect: "manual",
+    });
+    const lugar = (r.headers["location"] || "").trim();
+    if ([301, 302, 303, 307, 308].includes(r.status) && lugar) {
+      const destino = absolutizar(lugar);
+      if (destino && hostDe(destino) === "pixeldrain.com") {
+        const prueba = await kino.fetch(destino, {
+          headers: { Referer: HOST, Range: "bytes=0-0" },
+          redirect: "manual",
+        });
+        if (prueba.status === 404 || prueba.status === 410) {
+          return null; // el archivo ya expiró: este servidor no sirve
+        }
+        return { url: destino, mime: "video/mp4", headers: {} };
+      }
+    }
+  } catch (e) {
+    /* si la comprobación falla, se devuelve la dirección tal cual */
+  }
   return { url: url, mime: "video/mp4", headers: { Referer: HOST } };
 }
 
-// Maru: la página del embed trae la URL de metadatos con los MP4 en un CDN
-// (cdn<N>.my.mail.ru; el número cambia). Se devuelve el MP4 tal cual: lo
-// cubre "streamHosts": "any".
+// Maru: el embed trae (o es) el id de la API de metadatos, que
+// devuelve los MP4 directos en un CDN (cdn<N>.my.mail.ru; el número
+// cambia). Se devuelve el MP4 tal cual: lo cubre "streamHosts": "any".
 async function resolverMailru(src, referer) {
-  const m = src.match(/video\/embed\/(\d+)/);
-  if (!m) return null;
-  const meta = await bajarTexto("https://my.mail.ru/+/video/meta/" + m[1], {
+  let id = primerMatch(src, /video\/embed\/(\d+)/);
+  if (!id) {
+    // Embed de "comunidadmp4": el id del URL no sirve; la página
+    // trae la dirección real de metadatos.
+    const html = await bajarPagina(src, { Referer: referer });
+    id = primerMatch(html, /"metadataUrl"\s*:\s*"[^"]*\/meta\/(\d+)/) ||
+      primerMatch(html, /\/video\/meta\/(\d+)/);
+    if (!id) return null;
+  }
+  const meta = await bajarTexto("https://my.mail.ru/+/video/meta/" + id, {
     headers: Object.assign(encabezadosBase(), { Referer: src }),
   });
   let data;
@@ -642,7 +677,41 @@ async function resolverMailru(src, referer) {
   return { url: url, mime: "video/mp4", headers: { Referer: "https://my.mail.ru/" } };
 }
 
-// Servidores que arman la dirección con sus propios scripts: navegador oculto.
+// Okru: la página del embed trae la config del reproductor
+// (la duración y las direcciones de video) en su HTML, así
+// que no hace falta el navegador: se elige la de mejor calidad.
+function calidadOkru(nombre) {
+  const n = parseInt(primerMatch(nombre, /(\d+)/), 10);
+  if (n) return n;
+  const mapa = { hd: 720, sd: 480, low: 240 };
+  return mapa[nombre] || 0;
+}
+
+async function resolverOkru(src, referer) {
+  const html = await bajarPagina(src, { Referer: referer });
+  const limpio = html
+    .replace(/&quot;/g, '"')
+    .replace(/&amp;/g, "&")
+    .replace(/\\u0026/g, "&")
+    .replace(/\\u003a/gi, ":")
+    .replace(/\\u002f/gi, "/");
+  const videos = [];
+  for (const m of scan(/"name"\s*:\s*"([^"]+)"\s*,\s*"url"\s*:\s*"(https:[^"]+)"/g, limpio)) {
+    videos.push({ nombre: m[1].toLowerCase(), url: m[2] });
+  }
+  if (!videos.length) return null;
+  videos.sort((a, b) => calidadOkru(b.nombre) - calidadOkru(a.nombre));
+  return {
+    url: videos[0].url,
+    mime: "video/mp4",
+    // okcdn firma la dirección para el agente con que se pidió
+    // la config (srcAg): el reproductor debe pedir con el mismo.
+    headers: { Referer: "https://ok.ru/", "User-Agent": UA },
+  };
+}
+
+// Servidores que arman la dirección con sus propios scripts:
+// navegador oculto (Korii, Evo, VK, Dodo).
 async function resolverNavegador(src, referer) {
   if (typeof kino.browser === "undefined" || typeof kino.browser.capture !== "function") return null;
   let cap;
@@ -702,7 +771,8 @@ async function resolverIframe(src, referer) {
   const host = hostDe(src);
   if (host === "www.doramas.org" || host === "doramas.org") return await resolverKmp4(src, referer);
   if (host === "my.mail.ru") return await resolverMailru(src, referer);
-  if (host === "ok.ru" || host === "kory.4meplayer.pro" || host === "voe.sx" || host === "vk.com" || host === "playmogo.com") return await resolverNavegador(src, referer);
+  if (host === "ok.ru") return await resolverOkru(src, referer);
+  if (host === "kory.4meplayer.pro" || host === "voe.sx" || host === "vk.com" || host === "playmogo.com") return await resolverNavegador(src, referer);
   if (host === "short.icu") return await resolverRedir(src, referer);
   return null;
 }
@@ -758,7 +828,7 @@ async function resolverTitulo(url, hash, esPelicula) {
     if (!HOSTS_SOPORTADOS[host]) continue;
     const entrada = { s: s, src: src };
     probados.push(entrada);
-    if (host === "www.doramas.org" || host === "doramas.org" || host === "my.mail.ru" || host === "short.icu") {
+    if (host === "www.doramas.org" || host === "doramas.org" || host === "my.mail.ru" || host === "ok.ru" || host === "short.icu") {
       directos.push(entrada);
     } else {
       deNavegador.push(entrada);
