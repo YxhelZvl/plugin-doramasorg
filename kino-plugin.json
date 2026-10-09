@@ -1,25 +1,37 @@
 {
   "id": "doramasorg",
   "name": "Doramas.org",
-  "version": "1.0.0",
-  "apiVersion": 4,
+  "version": "2.0.0",
+  "apiVersion": 6,
   "entry": "plugin.js",
-  "description": "Doramas y películas asiáticas subtituladas al español: catálogo, géneros, últimos capítulos y búsqueda",
+  "icon": "icon.png",
+  "description": "Doramas y películas asiáticas subtituladas al español: busca series, explora el catálogo por género y reproduce con varios servidores",
   "author": "YxhelZvl",
   "homepage": "https://github.com/YxhelZvl/plugin-doramasorg",
   "hosts": [
     "www.doramas.org",
     "doramas.org",
-    "pics.doramas.org"
+    "pics.doramas.org",
+    "my.mail.ru",
+    "ok.ru",
+    "kory.4meplayer.pro",
+    "short.icu",
+    "voe.sx",
+    "vk.com",
+    "playmogo.com"
   ],
+  "streamHosts": "any",
+  "browser": true,
   "capabilities": [
     "search",
     "home",
     "browse",
     "episodes",
-    "resolve"
+    "resolve",
+    "download"
   ],
-  "streamHosts": "any",
-  "color": "#C0392B",
-  "icon": "icon.png"
+  "categories": [
+    "series",
+    "movies"
+  ]
 }
